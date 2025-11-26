@@ -1,16 +1,15 @@
 from database import Database
-from models import CartaoDeCredito, Gasto, Fatura
+from models import CartaoDeCredito, Gasto, Fatura, Usuario
 from datetime import datetime
+from typing import List
 
 
 class CartaoRepository:
 
-    def __init__(self, database=Database):
-
-        self.db = database
+    def __init__(self, database=None):
+        self.db = database if database else Database()
 
     def salvar(self, cartao: CartaoDeCredito, usuario_id: int) -> int:
-
         with self.db.get_connection() as conn:
             cursor = conn.execute(
                 """
@@ -21,16 +20,16 @@ class CartaoRepository:
                     cartao.nome,
                     cartao.limite_total,
                     cartao.limite_disponivel,
-                    cartao.dia_venciemento,
+                    cartao.dia_vencimento,
                 ),
             )
             return cursor.lastrowid
 
     def processar_compra_parcelada(self, cartao_id: int, gasto: Gasto) -> List[int]:
-
         with self.db.get_connection() as conn:
             cursor = conn.execute(
-                "SELECT limite_disponivel FROM cartoes WHERE cartao_id = ?", (cartao_id)
+                "SELECT limite_disponivel FROM cartoes WHERE cartao_id = ?",
+                (cartao_id,),
             )
             row = cursor.fetchone()
             if not row:
@@ -42,99 +41,113 @@ class CartaoRepository:
                 raise ValueError(
                     f"Limite Insuficiente!"
                     f"\nLimite disponível: R${limite_disponivel:.2f}"
-                    f"\nLimite disponível: R${limite_disponivel:.2f}"
+                    f"\nValor da compra: R${valor_total:.2f}"
                     f"\nFalta: R${valor_total-limite_disponivel:.2f}"
                 )
             conn.execute(
-                "UPDATE cartoes SET limite_disponivel =? WHERE cartao_id = ?",
-                (limite_disponivel, cartao_id),
+                "UPDATE cartoes SET limite_disponivel = ? WHERE cartao_id = ?",
+                (limite_disponivel - valor_total, cartao_id),
             )
 
-            data = datetime.datetime.strptime(gasto.data, "%d/%m/%Y")
-            valor_parcela = valor_total / gasto.parcelas7
+            data = datetime.strptime(gasto.data, "%d/%m/%Y")
+            valor_parcela = valor_total / gasto.parcelas
+            faturas_ids = []
             for p in range(gasto.parcelas):
                 mes_fatura = (data.month + p - 1) % 12 + 1
                 ano_fatura = data.year + ((data.month + p - 1) // 12)
 
-            cursor = conn.execute(
-                "SELECT id FROM faturas WHERE cartao_id =? AND mes = ? AND ano=?",
-                (cartao_id, mes_fatura, ano_fatura),
-            )
-            fatura_row = cursor.fetchone()
-
-            if fatura_row:
-                fatura_id = fatura_row["id"]
-            else:
                 cursor = conn.execute(
-                    """INSERT INTO faturas(cartao_id,mes,ano,dia_vencimento)
-                                VALUES (?,?,?,(SELECT dia_vencimento FROM cartoes WHERE id = ? )
-                                      """,
-                    (cartao_id, mes_fatura, ano_fatura, cartao_id),
+                    "SELECT id FROM faturas WHERE cartao_id = ? AND mes = ? AND ano = ?",
+                    (cartao_id, mes_fatura, ano_fatura),
                 )
-                fatura_id = cursor.lastrowid
-            faturas_ids.append
+                fatura_row = cursor.fetchone()
+
+                if fatura_row:
+                    fatura_id = fatura_row["id"]
+                else:
+                    cursor = conn.execute(
+                        """INSERT INTO faturas(cartao_id, mes, ano, dia_vencimento)
+                        VALUES (?, ?, ?, (SELECT dia_vencimento FROM cartoes WHERE id = ?))""",
+                        (cartao_id, mes_fatura, ano_fatura, cartao_id),
+                    )
+                    fatura_id = cursor.lastrowid
+                faturas_ids.append(fatura_id)
+
+                nome_parcela = f"{gasto.nome} - Parcela {p+1}/{gasto.parcelas}"
+
+                conn.execute(
+                    """INSERT INTO gastos
+                    (fatura_id, nome, valor, metodo_pagamento, data, periodicidade, categoria, parcelas)
+                    VALUES(?,?,?,?,?,?,?,1)""",
+                    (
+                        fatura_id,
+                        nome_parcela,
+                        valor_parcela,
+                        gasto.metodo_pagamento,
+                        gasto.data,
+                        gasto.periodicidade,
+                        gasto.categoria,
+                    ),
+                )
+            return faturas_ids
 
     def buscar_por_id(self, id: int):
-
         with self.db.get_connection() as conn:
-            cursor = conn.execute("SELECT * FROM usuarios WHERE id = ?", (usuario_id,))
-            row = cursor.fetchoone()
+            cursor = conn.execute("SELECT * FROM cartoes WHERE id = ?", (id,))
+            row = cursor.fetchone()
 
             if not row:
                 return None
-            usuario = Usuario(
+            cartao = CartaoDeCredito(
                 nome=row["nome"],
-                remuneracao_fixa=row["remuneracao_fixa"],
-                remuneracao_variavel=row["remuneracao_variavel"],
+                limite_total=row["limite_total"],
+                limite_disponivel=row["limite_disponivel"],
             )
-            usuario_id = row["id"]
+            cartao.id = row["id"]
+            cartao.dia_vencimento = row["dia_vencimento"]
 
-            usuario.cartoes = self._carregar_cartoes(conn, usuario_id)
-
-            return usuario
+            return cartao
 
     def _carregar_cartoes(self, conn, usuario_id: int) -> list[CartaoDeCredito]:
         cursor = conn.execute(
-            "SELECT * FROM cartoes WHERE usuario_id =?", (usuario_id,)
+            "SELECT * FROM cartoes WHERE usuario_id = ?", (usuario_id,)
         )
         cartoes = []
         for row in cursor.fetchall():
             cartao = CartaoDeCredito(
                 nome=row["nome"],
-                limite=row["limite"],
-                dia_vencimento=["dia_vencimento"],
+                limite_total=row["limite_total"],
+                dia_vencimento=row["dia_vencimento"],
             )
             cartao.id = row["id"]
-            cartao._limite_disponivel = row["limite_disponivel"]
+            cartao.limite_disponivel = row["limite_disponivel"]
             cartoes.append(cartao)
         return cartoes
 
-    def buscar_todos(self) -> list[Usuario]:
-
+    def buscar_todos(self) -> list[CartaoDeCredito]:
         with self.db.get_connection() as conn:
-            cursor = conn.execute("SELECR * FROM usuarios")
+            cursor = conn.execute("SELECT * FROM cartoes")
             ids = [row["id"] for row in cursor.fetchall()]
             return [self.buscar_por_id(id) for id in ids]
 
-    def atualizar(self, usuario: Usuario):
-
-        if not hasattr(usuario, id):
-            raise ValueError("O usuário deve ter um ID válido para atualização.")
+    def atualizar(self, cartao: CartaoDeCredito):
+        if not hasattr(cartao, "id"):
+            raise ValueError("O cartão deve ter um ID válido para atualização.")
 
         with self.db.get_connection() as conn:
             conn.execute(
-                """UPDATE usuarios
-                SET nome = ?, remuneracao_fixa = ?, remuneracao_variavel=?
+                """UPDATE cartoes
+                SET nome = ?, limite_total = ?, limite_disponivel = ?, dia_vencimento = ?
                 WHERE id = ?""",
                 (
-                    usuario.noome,
-                    usuario.remuneracao_fixa,
-                    usuario.remuneracao_variavel,
-                    usuario.id,
+                    cartao.nome,
+                    cartao.limite_total,
+                    cartao.limite_disponivel,
+                    cartao.dia_vencimento,
+                    cartao.id,
                 ),
             )
 
-    def deletar(self, usuario_id: int):
-
+    def deletar(self, cartao_id: int):
         with self.db.get_connection() as conn:
-            conn.execute("DELETE FROMM usuarios WHERE id = ?", (usuario_id,))
+            conn.execute("DELETE FROM cartoes WHERE id = ?", (cartao_id,))
